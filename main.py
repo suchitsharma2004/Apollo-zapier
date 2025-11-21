@@ -883,7 +883,7 @@ def call_parallel_mca_fallback(company_name: str):
             }
         
         # Parallel API configuration
-        api_key = CONFIG.get("PARALLEL_API_KEY") or "dZE6nnwRdoHBP0YB4CAfwoy8L-wRrxchNlekN0Q0"
+        api_key = CONFIG.get("PARALLEL_API_KEY")
         
         logger.info(f"📤 Parallel API Request Configuration:")
         logger.info(f"   Company Name: {company_name}")
