@@ -3593,3 +3593,5 @@ Submit
 2025-11-21 17:47:17,716 - INFO - 📊 ✅ Data saved to CSV: 1 discovered contacts + input contact for Good Drop Wine Cellars Private Limited
 2025-11-21 17:47:17,716 - INFO - 📁 CSV Location: /Users/suchitsharma/Documents/GitHub/Apollo-zapier/automation_data.csv
 2025-11-21 17:47:17,716 - INFO - --- AUTOMATION COMPLETE ---
+2025-11-21 17:52:29,252 - INFO - ✅ All required environment variables loaded successfully
+2025-11-21 17:53:07,669 - INFO - ✅ All required environment variables loaded successfully

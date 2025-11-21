@@ -4,10 +4,23 @@ import logging
 import requests
 import csv
 import os
+import os
+import re
+import json
+import csv
+import logging
+import requests
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, BackgroundTasks, Request
 from pydantic import BaseModel
+
+# Load environment variables from .env file
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    print("Warning: python-dotenv not installed. Using system environment variables.")
 
 # Configure logging to file for debugging
 logging.basicConfig(
@@ -21,23 +34,37 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- CONFIGURATION ---
-# In a real production app, use os.getenv() for these keys
+# Load configuration from environment variables
+def get_job_titles():
+    """Parse job titles from environment variable"""
+    job_titles_str = os.getenv("JOB_TITLES", "HR,Human Resources,Recruiting,Talent Acquisition,People Operations,CHRO,Chief People Officer,Head of HR,Head of Talent,HR Manager")
+    return [title.strip() for title in job_titles_str.split(',')]
+
 CONFIG = {
-    "EPFO_AUTH": "U9J096G8ID7UTKU",
-    "INTERNAL_TOKEN": "a8225adf-c1d0-4a01-9853-4456c2b9a749",
-    "PORTKEY_KEY": "YoOaYwcZkhrUD4Cmom8pD4IvD+v/",
-    "PORTKEY_VIRTUAL": "google-springve-6cb775",
-    "APOLLO_KEY": "OClRtaraAlYhkyzxkGdDHg",
-    "HATCH_KEY": "U2FsdGVkX196jXioU4DcI_nIoFDW3wF_xUS9OPtT8444P3kZCdERg77CvPB6-ZWrr5UIMTbdBdxOIxhT2_zgrQ", 
-    "CAMPAIGN_ID": "68d1103b41c0f700155cd927",
-    "EMAIL_SENDER_ID": "621f02521d8f2b00f95fa455",
-    "JOB_TITLES": ["HR", "Human Resources", "Recruiting", "Talent Acquisition", "People Operations", "CHRO", "Chief People Officer", "Head of HR", "Head of Talent", "HR Manager"],
-    "PARALLEL_API_KEY": "dZE6nnwRdoHBP0YB4CAfwoy8L-wRrxchNlekN0Q0"
+    "EPFO_AUTH": os.getenv("EPFO_AUTH"),
+    "INTERNAL_TOKEN": os.getenv("INTERNAL_TOKEN"),
+    "PORTKEY_KEY": os.getenv("PORTKEY_KEY"),
+    "PORTKEY_VIRTUAL": os.getenv("PORTKEY_VIRTUAL"),
+    "APOLLO_KEY": os.getenv("APOLLO_KEY"),
+    "HATCH_KEY": os.getenv("HATCH_KEY"), 
+    "CAMPAIGN_ID": os.getenv("CAMPAIGN_ID"),
+    "EMAIL_SENDER_ID": os.getenv("EMAIL_SENDER_ID"),
+    "JOB_TITLES": get_job_titles(),
+    "PARALLEL_API_KEY": os.getenv("PARALLEL_API_KEY")
 }
 
 # Setup Logging (Prints to VS Code Terminal)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# Validate that all required environment variables are set
+required_vars = ["EPFO_AUTH", "INTERNAL_TOKEN", "PORTKEY_KEY", "PORTKEY_VIRTUAL", "APOLLO_KEY", "HATCH_KEY", "CAMPAIGN_ID", "EMAIL_SENDER_ID", "PARALLEL_API_KEY"]
+missing_vars = [var for var in required_vars if not CONFIG.get(var)]
+if missing_vars:
+    logger.error(f"❌ Missing required environment variables: {missing_vars}")
+    logger.error("Please check your .env file and ensure all required variables are set.")
+else:
+    logger.info("✅ All required environment variables loaded successfully")
 
 app = FastAPI()
 
