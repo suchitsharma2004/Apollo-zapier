@@ -43,14 +43,13 @@ def get_job_titles():
 CONFIG = {
     "EPFO_AUTH": os.getenv("EPFO_AUTH"),
     "INTERNAL_TOKEN": os.getenv("INTERNAL_TOKEN"),
-    "PORTKEY_KEY": os.getenv("PORTKEY_KEY"),
-    "PORTKEY_VIRTUAL": os.getenv("PORTKEY_VIRTUAL"),
     "APOLLO_KEY": os.getenv("APOLLO_KEY"),
     "HATCH_KEY": os.getenv("HATCH_KEY"), 
     "CAMPAIGN_ID": os.getenv("CAMPAIGN_ID"),
     "EMAIL_SENDER_ID": os.getenv("EMAIL_SENDER_ID"),
     "JOB_TITLES": get_job_titles(),
-    "PARALLEL_API_KEY": os.getenv("PARALLEL_API_KEY")
+    "PARALLEL_API_KEY": os.getenv("PARALLEL_API_KEY"),
+    "KICKBOX_API_KEY": os.getenv("KICKBOX_API_KEY")
 }
 
 # Setup Logging (Prints to VS Code Terminal)
@@ -58,7 +57,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # Validate that all required environment variables are set
-required_vars = ["EPFO_AUTH", "INTERNAL_TOKEN", "PORTKEY_KEY", "PORTKEY_VIRTUAL", "APOLLO_KEY", "HATCH_KEY", "CAMPAIGN_ID", "EMAIL_SENDER_ID", "PARALLEL_API_KEY"]
+required_vars = ["EPFO_AUTH", "INTERNAL_TOKEN", "APOLLO_KEY", "HATCH_KEY", "CAMPAIGN_ID", "EMAIL_SENDER_ID", "PARALLEL_API_KEY", "KICKBOX_API_KEY"]
 missing_vars = [var for var in required_vars if not CONFIG.get(var)]
 if missing_vars:
     logger.error(f"❌ Missing required environment variables: {missing_vars}")
@@ -104,6 +103,42 @@ def clean_company_name(name: str) -> str:
     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
     # Capitalize first letter of each word
     return cleaned.title()
+
+def is_llp_company(company_name: str) -> bool:
+    """
+    Check if a company is an LLP (Limited Liability Partnership) based on its name
+    
+    Args:
+        company_name: The company name to check
+    
+    Returns:
+        bool: True if it's an LLP company, False otherwise
+    """
+    if not company_name or not isinstance(company_name, str):
+        return False
+    
+    company_lower = company_name.lower().strip()
+    
+    llp_indicators = [
+        'llp',
+        'limited liability partnership',
+        ' llp.',
+        ' llp',
+        'llp)',
+        '(llp)'
+    ]
+    
+    for indicator in llp_indicators:
+        if indicator in company_lower:
+            return True
+    
+    # Check if it ends with LLP variations
+    llp_endings = ['llp', 'llp.', 'limited liability partnership']
+    for ending in llp_endings:
+        if company_lower.endswith(ending):
+            return True
+    
+    return False
 
 def format_date_yyyy_mm_dd(date_str: str) -> str:
     if not date_str or date_str.upper() == "N/A" or not date_str.strip():
@@ -154,6 +189,64 @@ def extract_company_id(raw_input: Any) -> str:
     if match: return match.group(1)
     
     return None
+
+# --- EMAIL VALIDATION ---
+
+def validate_email_kickbox(email: str) -> bool:
+    """
+    Validates email using Kickbox API
+    Returns True if email is deliverable, False otherwise
+    """
+    if not email or not email.strip():
+        logger.info("❌ Email validation: Empty email provided")
+        return False
+    
+    if not CONFIG.get("KICKBOX_API_KEY"):
+        logger.warning("⚠️ Kickbox API key not configured - skipping validation")
+        return True  # Skip validation if no API key
+    
+    try:
+        logger.info(f"📧 Validating email: {email}")
+        
+        # Prepare parameters
+        params = {
+            'email': email.strip(),
+            'apikey': CONFIG["KICKBOX_API_KEY"],
+            'timeout': 6000  # 6 second timeout
+        }
+        
+        # Make the GET request to Kickbox API
+        response = requests.get("https://api.kickbox.com/v2/verify", params=params, timeout=10)
+        
+        logger.info(f"📊 Kickbox Response Status: {response.status_code}")
+        
+        if response.status_code == 200:
+            data = response.json()
+            result = data.get('result', '')
+            reason = data.get('reason', '')
+            sendex = data.get('sendex', 0)
+            
+            logger.info(f"📋 Kickbox Response: result={result}, reason={reason}, sendex={sendex}")
+            
+            # Check if email is deliverable
+            if result == "deliverable":
+                logger.info(f"✅ Email validation PASSED: {email} (sendex: {sendex})")
+                return True
+            else:
+                logger.info(f"❌ Email validation FAILED: {email} - result: {result}, reason: {reason}")
+                return False
+                
+        else:
+            logger.error(f"❌ Kickbox API error: {response.status_code} - {response.text}")
+            return True  # On API error, allow email through (don't block automation)
+            
+    except requests.exceptions.Timeout:
+        logger.error(f"❌ Kickbox API timeout for email: {email}")
+        return True  # On timeout, allow email through
+        
+    except Exception as e:
+        logger.error(f"❌ Kickbox validation error for {email}: {str(e)}")
+        return True  # On any error, allow email through (don't block automation)
 
 # --- API SERVICES ---
 
@@ -287,13 +380,25 @@ def upsert_erdb(company_data: dict):
         epfo_payment_status = "NA"
 
     # 3. Construct the Full Request Body (matching JS structure)
+    # Handle both CIN and LLPIN
+    mca_section = {
+        "status": mca_status,
+        "dateOfIncorporation": format_date_yyyy_mm_dd(company_data.get('dateOfIncorporation')),
+    }
+    
+    # Add CIN or LLPIN value (always use "cin" key, but value can be CIN or LLPIN)
+    if company_data.get('cin'):
+        mca_section["cin"] = company_data.get('cin')
+        logger.info(f"📋 Added CIN to ERDB request: {company_data.get('cin')}")
+    elif company_data.get('llpin'):
+        mca_section["cin"] = company_data.get('llpin')  # Use "cin" key but LLPIN value
+        logger.info(f"📋 Added LLPIN to ERDB request (using cin key): {company_data.get('llpin')}")
+    else:
+        mca_section["cin"] = None  # Fallback for compatibility
+    
     request_body = {
         "legalName": company_data.get('legalName'),
-        "mca": {
-            "status": mca_status,
-            "dateOfIncorporation": format_date_yyyy_mm_dd(company_data.get('dateOfIncorporation')),
-            "cin": company_data.get('cin') or None
-        },
+        "mca": mca_section,
         "epfo": {
             "status": epfo_status,
             "paymentDetails": epfo_payment_status,
@@ -329,51 +434,125 @@ def upsert_erdb(company_data: dict):
         logger.error(f"ERDB Upsert Failed: {e}")
         return None
 
-def get_domain_llm(legal_name: str, email: str):
-    """Step 7: Get Domain via Email Regex or LLM Search"""
-    generic_domains = ["gmail.com", "yahoo.com", "outlook.com", "hotmail.com"]
+def get_company_domain_parallel_ai(company_name: str) -> str:
+    """
+    Get the primary domain for a company using Parallel AI
+    This is a fallback when no email/domain is found via webhook
+    """
+    logger.info(f"🔍 Using Parallel AI to find domain for: {company_name}")
     
-    # 1. Check Email
+    try:
+        from parallel import Parallel
+        
+        client = Parallel(api_key=CONFIG["PARALLEL_API_KEY"])
+        
+        # Simple search for domain discovery
+        objective = f'Find the official website domain for {company_name}'
+        search_queries = [f"{company_name} official website", company_name]
+        
+        # Search without domain restrictions
+        response = client.beta.search(
+            mode="one-shot",
+            search_queries=search_queries,
+            max_results=8,
+            objective=objective
+        )
+        
+        # Extract just the primary domain
+        if hasattr(response, 'results'):
+            url_domains = []
+            generic_domains = {
+                'google.com', 'linkedin.com', 'facebook.com', 'twitter.com', 
+                'instagram.com', 'youtube.com', 'wikipedia.org', 'zaubacorp.com',
+                'justdial.com', 'crunchbase.com', 'github.com', 'stackoverflow.com',
+                'cleartax.in', 'instafinancials.com', 'tracxn.com', 'bloomberg.com'
+            }
+            
+            # Extract domains from URLs (most reliable)
+            for result in response.results:
+                if hasattr(result, 'url'):
+                    url_match = re.search(r'https?://(?:www\.)?([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', result.url)
+                    if url_match:
+                        domain = url_match.group(1).lower()
+                        if domain not in generic_domains:
+                            url_domains.append(domain)
+            
+            if url_domains:
+                # Remove duplicates while preserving order
+                unique_domains = []
+                seen = set()
+                for domain in url_domains:
+                    if domain not in seen:
+                        unique_domains.append(domain)
+                        seen.add(domain)
+                
+                # Score domains for relevance
+                company_words = [word.lower() for word in company_name.split() if len(word) > 3]
+                domain_scores = {}
+                
+                for domain in unique_domains:
+                    score = 0
+                    
+                    # Company name match
+                    for word in company_words:
+                        if word in domain:
+                            score += 50
+                    
+                    # Domain extension preference
+                    if domain.endswith('.com'):
+                        score += 20
+                    elif domain.endswith('.in'):
+                        score += 15
+                    
+                    # Shorter domains preferred
+                    if len(domain) < 15:
+                        score += 10
+                    
+                    # Simple domain structure
+                    if domain.count('.') == 1:
+                        score += 15
+                    
+                    domain_scores[domain] = score
+                
+                # Return highest scoring domain
+                best_domain = max(domain_scores.keys(), key=lambda d: domain_scores[d])
+                logger.info(f"✅ Parallel AI found primary domain: {best_domain}")
+                return best_domain
+        
+        logger.info(f"❌ Parallel AI: No domain found for {company_name}")
+        return ""
+        
+    except Exception as e:
+        logger.error(f"❌ Parallel AI domain discovery error: {str(e)}")
+        return ""
+
+def get_domain_llm(legal_name: str, email: str):
+    """Step 7: Get Domain via Email Regex with Parallel AI fallback"""
+    
+    # Check Email for domain extraction (accept all domains including generic ones)
     if email:
         match = re.search(r"@([^\s@]+)", email)
         if match:
             domain = match.group(1).lower()
-            if domain not in generic_domains:
-                logger.info(f"Domain found from email: {domain}")
-                return domain
-
-    # 2. LLM Search via Portkey
-    if not legal_name: return None
+            logger.info(f"✅ Domain found from email: {domain}")
+            return domain
     
-    logger.info(f"Asking LLM to find domain for: {legal_name}")
-    prompt = f"""
-    Find the website domain for company: {legal_name}.
-    Return ONLY JSON: {{"domain_found": "example.com"}} or null.
-    """
+    # No domain found from email - use Parallel AI as fallback
+    logger.info(f"⚠️ No email provided - using Parallel AI fallback for domain discovery")
     
-    payload = {
-        "model": "gemini-2.5-flash",
-        "messages": [{"role": "user", "content": prompt}],
-        "tools": [{"type": "function", "function": {"name": "google_search"}}]
-    }
+    if not CONFIG.get("PARALLEL_API_KEY"):
+        logger.warning("⚠️ Parallel API key not configured - skipping domain fallback")
+        return None
     
-    headers = {
-        "x-portkey-api-key": CONFIG["PORTKEY_KEY"],
-        "x-portkey-virtual-key": CONFIG["PORTKEY_VIRTUAL"],
-        "Content-Type": "application/json"
-    }
+    # Use Parallel AI to discover the domain
+    parallel_domain = get_company_domain_parallel_ai(legal_name)
     
-    try:
-        res = requests.post("https://api.portkey.ai/v1/chat/completions", json=payload, headers=headers)
-        data = res.json()
-        content = data["choices"][0]["message"]["content"]
-        # Simple extraction logic (can be improved with json parsing)
-        match = re.search(r'"domain_found"\s*:\s*"([^"]+)"', content)
-        if match: return match.group(1)
-    except Exception as e:
-        logger.error(f"LLM Call Failed: {e}")
-    
-    return None
+    if parallel_domain:
+        logger.info(f"✅ Parallel AI fallback found domain: {parallel_domain}")
+        return parallel_domain
+    else:
+        logger.info(f"❌ No domain found via any method for company: {legal_name}")
+        return None
 
 def search_apollo_global(target: str):
     """Search Apollo using mixed_people/search API (global search)"""
@@ -452,28 +631,32 @@ def process_contacts(domain: str, company_name: str, db_company_id: str, manual_
     if manual_email:
         logger.info(f"📧 Processing manual email from webhook: {manual_email}")
         
-        # Parse name or use company name + HR as fallback
-        if manual_name and manual_name.strip():
-            name_parts = manual_name.strip().split(' ')
-            first_name = name_parts[0] if name_parts else "HR"
-            last_name = ' '.join(name_parts[1:]) if len(name_parts) > 1 else "Manager"
+        # Validate manual email with Kickbox first
+        if validate_email_kickbox(manual_email):
+            # Parse name or use company name + HR as fallback
+            if manual_name and manual_name.strip():
+                name_parts = manual_name.strip().split(' ')
+                first_name = name_parts[0] if name_parts else "HR"
+                last_name = ' '.join(name_parts[1:]) if len(name_parts) > 1 else "Manager"
+            else:
+                # Use company name as first name, HR as last name
+                first_name = company_name or "HR"
+                last_name = "HR"
+            
+            manual_contact = {
+                "id": None,  # Manual contacts don't have Apollo IDs initially
+                "first_name": first_name,
+                "last_name": last_name,
+                "title": "HR",
+                "full_name": f"{first_name} {last_name}",
+                "email": manual_email,
+                "source": "manual_input"
+            }
+            
+            final_contacts.append(manual_contact)
+            logger.info(f"✅ Added manual contact (validated): {manual_contact['full_name']} - {manual_email}")
         else:
-            # Use company name as first name, HR as last name
-            first_name = company_name or "HR"
-            last_name = "HR"
-        
-        manual_contact = {
-            "id": None,  # Manual contacts don't have Apollo IDs initially
-            "first_name": first_name,
-            "last_name": last_name,
-            "title": "HR",
-            "full_name": f"{first_name} {last_name}",
-            "email": manual_email,
-            "source": "manual_input"
-        }
-        
-        final_contacts.append(manual_contact)
-        logger.info(f"✅ Added manual contact: {manual_contact['full_name']} - {manual_email}")
+            logger.info(f"❌ Manual email REJECTED (validation failed): {manual_email} - skipping")
     
     if not domain:
         logger.info("No domain provided, only processing manual email.")
@@ -522,9 +705,13 @@ def process_contacts(domain: str, company_name: str, db_company_id: str, manual_
             if contact['email'] and contact['email'] != "email_not_unlocked@domain.com" and "email_not_unlocked" not in contact['email']:
                 # Check for duplicates (including manual email)
                 if not any(f.get('email', '').lower() == contact['email'].lower() for f in final_contacts):
-                    contact['source'] = "apollo_ready"
-                    final_contacts.append(contact)
-                    logger.info(f"✅ Contact {i+1}: {full_name} ({contact['title']}) - Email READY: {contact['email']}")
+                    # Validate email with Kickbox before adding
+                    if validate_email_kickbox(contact['email']):
+                        contact['source'] = "apollo_ready"
+                        final_contacts.append(contact)
+                        logger.info(f"✅ Contact {i+1}: {full_name} ({contact['title']}) - Email READY & VALIDATED: {contact['email']}")
+                    else:
+                        logger.info(f"❌ Contact {i+1}: {full_name} - Email REJECTED (validation failed): {contact['email']}")
                 else:
                     logger.info(f"⚠️ Contact {i+1}: {full_name} - Email already exists (duplicate): {contact['email']}")
             else:
@@ -568,13 +755,17 @@ def process_contacts(domain: str, company_name: str, db_company_id: str, manual_
                 if match and match.get('email') and "email_not_unlocked" not in match.get('email'):
                     # Check for duplicates before adding
                     if not any(f.get('email', '').lower() == match['email'].lower() for f in final_contacts):
-                        rescued_contact = candidate.copy()
-                        rescued_contact['email'] = match['email']
-                        rescued_contact['source'] = 'apollo_enriched'
-                        final_contacts.append(rescued_contact)
-                        rescue_count += 1
-                        rescued = True
-                        logger.info(f"✅ Enriched {j+1}: {candidate['full_name']} - Unlocked: {match['email']}")
+                        # Validate email with Kickbox before adding
+                        if validate_email_kickbox(match['email']):
+                            rescued_contact = candidate.copy()
+                            rescued_contact['email'] = match['email']
+                            rescued_contact['source'] = 'apollo_enriched'
+                            final_contacts.append(rescued_contact)
+                            rescue_count += 1
+                            rescued = True
+                            logger.info(f"✅ Enriched {j+1}: {candidate['full_name']} - Unlocked & Validated: {match['email']}")
+                        else:
+                            logger.info(f"❌ Enriched {j+1}: {candidate['full_name']} - Email REJECTED (validation failed): {match['email']}")
             
             # If enrichment failed, try Hatch
             if not rescued and domain:
@@ -583,13 +774,17 @@ def process_contacts(domain: str, company_name: str, db_company_id: str, manual_
                 if hatch_email:
                     # Check for duplicates before adding
                     if not any(f.get('email', '').lower() == hatch_email.lower() for f in final_contacts):
-                        rescued_contact = candidate.copy()
-                        rescued_contact['email'] = hatch_email
-                        rescued_contact['source'] = 'hatch'
-                        rescued_contact['id'] = None  # Hatch contacts don't have Apollo IDs
-                        final_contacts.append(rescued_contact)
-                        hatch_count += 1
-                        logger.info(f"✅ Hatch Success: {candidate['full_name']} - Found: {hatch_email}")
+                        # Validate email with Kickbox before adding
+                        if validate_email_kickbox(hatch_email):
+                            rescued_contact = candidate.copy()
+                            rescued_contact['email'] = hatch_email
+                            rescued_contact['source'] = 'hatch'
+                            rescued_contact['id'] = None  # Hatch contacts don't have Apollo IDs
+                            final_contacts.append(rescued_contact)
+                            hatch_count += 1
+                            logger.info(f"✅ Hatch Success: {candidate['full_name']} - Found & Validated: {hatch_email}")
+                        else:
+                            logger.info(f"❌ Hatch email REJECTED (validation failed): {candidate['full_name']} - {hatch_email}")
                     else:
                         logger.info(f"⚠️ Hatch found duplicate email for: {candidate['full_name']}")
                 else:
@@ -781,6 +976,7 @@ def ensure_csv_exists():
             'Timestamp',
             'Company_Name',
             'CIN_Number',
+            'LLPIN_Number',
             'Date_Of_Incorporation', 
             'Company_Status',
             'Establishment_Code',
@@ -819,6 +1015,7 @@ def save_to_csv(company_data: dict, contacts: list, input_name: str, input_email
         # Company data
         company_name = company_data.get('legalName', '')
         cin_number = company_data.get('cin', '')
+        llpin_number = company_data.get('llpin', '')  # Add LLPIN support
         date_of_incorporation = company_data.get('dateOfIncorporation', '')
         company_status = company_data.get('status', '')
         establishment_code = company_data.get('establishmentId', '')
@@ -841,6 +1038,7 @@ def save_to_csv(company_data: dict, contacts: list, input_name: str, input_email
             timestamp,
             company_name,
             cin_number,
+            llpin_number,  # Add LLPIN column
             date_of_incorporation,
             company_status, 
             establishment_code,
@@ -862,8 +1060,12 @@ def save_to_csv(company_data: dict, contacts: list, input_name: str, input_email
 # --- PARALLEL API FALLBACK FUNCTIONS ---
 
 def call_parallel_mca_fallback(company_name: str):
-    """Parallel API fallback for MCA data - Gets CIN, Date of Incorporation, Company Status"""
+    """Parallel API fallback for MCA data - Gets CIN/LLPIN, Date of Incorporation, Company Status"""
     logger.info(f"🔄 Calling Parallel API fallback for MCA: {company_name}")
+    
+    # Check if this is an LLP company
+    is_llp = is_llp_company(company_name)
+    logger.info(f"📋 Is LLP Company: {is_llp}")
     
     try:
         # Import Parallel SDK
@@ -874,11 +1076,13 @@ def call_parallel_mca_fallback(company_name: str):
             logger.error(f"❌ Parallel SDK not installed: {import_error}")
             logger.error("   Install with: pip install parallel")
             return {
-                "cin": "",
+                "cin": "" if not is_llp else None,
+                "llpin": "" if is_llp else None,
                 "date_of_incorporation": "",
                 "company_status": "",
                 "status": "sdk_not_available",
                 "source": "parallel_fallback",
+                "is_llp": is_llp,
                 "error": "Parallel SDK not installed"
             }
         
@@ -887,6 +1091,7 @@ def call_parallel_mca_fallback(company_name: str):
         
         logger.info(f"📤 Parallel API Request Configuration:")
         logger.info(f"   Company Name: {company_name}")
+        logger.info(f"   Company Type: {'LLP' if is_llp else 'Regular Company'}")
         logger.info(f"   API Key: {api_key[:20]}... (length: {len(api_key)})")
         
         # Initialize Parallel client
@@ -901,17 +1106,23 @@ def call_parallel_mca_fallback(company_name: str):
             logger.error(f"   Error Type: {type(client_error).__name__}")
             logger.error(f"   Error Details: {repr(client_error)}")
             return {
-                "cin": "",
+                "cin": "" if not is_llp else None,
+                "llpin": "" if is_llp else None,
                 "date_of_incorporation": "",
                 "company_status": "",
                 "status": "client_init_error",
                 "source": "parallel_fallback",
+                "is_llp": is_llp,
                 "error": f"Client initialization failed: {str(client_error)}"
             }
         
-        # Use exact same parameters that worked in test
-        objective = f'Find company information for {company_name}'
-        search_queries = [company_name]  # Simple company name only, no "CIN" suffix
+        # Set objective based on company type (LLP vs Regular)
+        if is_llp:
+            objective = f'Find detailed LLP information for {company_name} including LLPIN number, date of incorporation, and LLP status'
+        else:
+            objective = f'Find detailed company information for {company_name} including CIN number, date of incorporation, and company status'
+        
+        search_queries = [company_name]  # Simple company name only
         source_domains = ["zaubacorp.com"]  # Only zaubacorp, cleartax seems to cause issues
         
         logger.info(f"📋 Parallel API Search Parameters:")
@@ -964,21 +1175,24 @@ def call_parallel_mca_fallback(company_name: str):
         logger.info(f"📋 Full Raw Response: {str(response)}")
         
         # Extract data from Parallel API response
-        logger.info("🔍 Extracting company data from Parallel API response...")
+        logger.info(f"🔍 Extracting {'LLP' if is_llp else 'company'} data from Parallel API response...")
         try:
-            extracted_data = extract_company_data_from_parallel_response(response, company_name)
+            extracted_data = extract_company_data_from_parallel_response(response, company_name, is_llp)
             extracted_data["source"] = "parallel_fallback"
+            extracted_data["is_llp"] = is_llp
             logger.info("✅ Data extraction completed successfully")
         except Exception as extraction_error:
             logger.error(f"❌ Data extraction failed: {extraction_error}")
             logger.error(f"   Error Type: {type(extraction_error).__name__}")
             logger.error(f"   Error Details: {repr(extraction_error)}")
             return {
-                "cin": "",
+                "cin": "" if not is_llp else None,
+                "llpin": "" if is_llp else None,
                 "date_of_incorporation": "",
                 "company_status": "",
                 "status": "extraction_error",
                 "source": "parallel_fallback",
+                "is_llp": is_llp,
                 "error": f"Data extraction failed: {str(extraction_error)}"
             }
         
@@ -1009,16 +1223,24 @@ def call_parallel_mca_fallback(company_name: str):
 
 
 
-def extract_company_data_from_parallel_response(response, company_name: str) -> dict:
-    """Extract CIN, Date of Incorporation, and Company Status from Parallel API SearchResult response"""
-    logger.info(f"🔍 Starting data extraction for company: {company_name}")
+def extract_company_data_from_parallel_response(response, company_name: str, is_llp: bool = False) -> dict:
+    """Extract CIN/LLPIN, Date of Incorporation, and Company Status from Parallel API SearchResult response"""
+    logger.info(f"🔍 Starting data extraction for {'LLP' if is_llp else 'company'}: {company_name}")
     
-    extracted = {
-        "cin": "",
-        "date_of_incorporation": "",
-        "company_status": "",
-        "status": "not_found"
-    }
+    if is_llp:
+        extracted = {
+            "llpin": "",
+            "date_of_incorporation": "",
+            "company_status": "",
+            "status": "not_found"
+        }
+    else:
+        extracted = {
+            "cin": "",
+            "date_of_incorporation": "",
+            "company_status": "",
+            "status": "not_found"
+        }
     
     logger.info(f"📊 Response structure analysis:")
     logger.info(f"   Response type: {type(response)}")
@@ -1057,23 +1279,39 @@ def extract_company_data_from_parallel_response(response, company_name: str) -> 
                 title_text = result.title
                 logger.info(f"   Title: {title_text}")
             
-            # FIRST: Try to extract CIN from URL (most reliable source)
-            if url_text and not extracted["cin"]:
-                logger.info(f"   🔗 Extracting CIN from URL: {url_text}")
-                # Enhanced CIN pattern for URLs - more comprehensive
-                cin_url_patterns = [
-                    r'-([A-Z]\d{5}[A-Z]{2}\d{4}[A-Z]{3}\d{6})(?:/|$)',  # CIN with dash prefix (most common)
-                    r'/([A-Z]\d{5}[A-Z]{2}\d{4}[A-Z]{3}\d{6})(?:/|$)',  # Standard CIN in URL path
-                    r'CIN-([A-Z]\d{5}[A-Z]{2}\d{4}[A-Z]{3}\d{6})',  # CIN- prefix
-                    r'cin/([A-Z]\d{5}[A-Z]{2}\d{4}[A-Z]{3}\d{6})',  # cin/ prefix
-                    r'([A-Z]\d{5}[A-Z]{2}\d{4}[A-Z]{3}\d{6})'  # CIN anywhere in URL (fallback)
-                ]
-                for pattern in cin_url_patterns:
-                    cin_match = re.search(pattern, url_text.upper())
-                    if cin_match:
-                        extracted["cin"] = cin_match.group(1)
-                        logger.info(f"   🎯 CIN Extracted from URL: {extracted['cin']}")
-                        break
+            # FIRST: Try to extract CIN or LLPIN from URL (most reliable source)
+            if url_text:
+                if is_llp and "llpin" in extracted and not extracted["llpin"]:
+                    logger.info(f"   🔗 Extracting LLPIN from URL: {url_text}")
+                    # LLPIN patterns for URLs
+                    llpin_url_patterns = [
+                        r'-([A-Z]{3}-\d{4})(?:/|$)',  # LLPIN with dash prefix (most common)
+                        r'/([A-Z]{3}-\d{4})(?:/|$)',  # Standard LLPIN in URL path
+                        r'LLPIN-([A-Z]{3}-\d{4})',  # LLPIN- prefix
+                        r'([A-Z]{3}-\d{4})'  # LLPIN anywhere in URL (fallback)
+                    ]
+                    for pattern in llpin_url_patterns:
+                        llpin_match = re.search(pattern, url_text.upper())
+                        if llpin_match:
+                            extracted["llpin"] = llpin_match.group(1)
+                            logger.info(f"   🎯 LLPIN Extracted from URL: {extracted['llpin']}")
+                            break
+                elif not is_llp and "cin" in extracted and not extracted["cin"]:
+                    logger.info(f"   🔗 Extracting CIN from URL: {url_text}")
+                    # Enhanced CIN pattern for URLs - more comprehensive
+                    cin_url_patterns = [
+                        r'-([A-Z]\d{5}[A-Z]{2}\d{4}[A-Z]{3}\d{6})(?:/|$)',  # CIN with dash prefix (most common)
+                        r'/([A-Z]\d{5}[A-Z]{2}\d{4}[A-Z]{3}\d{6})(?:/|$)',  # Standard CIN in URL path
+                        r'CIN-([A-Z]\d{5}[A-Z]{2}\d{4}[A-Z]{3}\d{6})',  # CIN- prefix
+                        r'cin/([A-Z]\d{5}[A-Z]{2}\d{4}[A-Z]{3}\d{6})',  # cin/ prefix
+                        r'([A-Z]\d{5}[A-Z]{2}\d{4}[A-Z]{3}\d{6})'  # CIN anywhere in URL (fallback)
+                    ]
+                    for pattern in cin_url_patterns:
+                        cin_match = re.search(pattern, url_text.upper())
+                        if cin_match:
+                            extracted["cin"] = cin_match.group(1)
+                            logger.info(f"   🎯 CIN Extracted from URL: {extracted['cin']}")
+                            break
             
             # Process each excerpt for remaining data
             for j, excerpt in enumerate(excerpts):
@@ -1084,8 +1322,27 @@ def extract_company_data_from_parallel_response(response, company_name: str) -> 
                 if isinstance(excerpt, str):
                     excerpt_upper = excerpt.upper()
                     
-                    # Extract CIN from excerpt if not found in URL
-                    if not extracted["cin"]:
+                    # Extract CIN or LLPIN from excerpt if not found in URL
+                    if is_llp and "llpin" in extracted and not extracted["llpin"]:
+                        llpin_patterns = [
+                            r'LLPIN[:\s]*([A-Z]{3}-\d{4})',  # LLPIN: format
+                            r'LLPIN\s+NUMBER[:\s]*([A-Z]{3}-\d{4})',  # LLPIN Number: format
+                            r'LLP\s+IDENTIFICATION\s+NUMBER[:\s]*([A-Z]{3}-\d{4})',  # LLP Identification Number
+                            r'([A-Z]{3}-\d{4})',  # Just the LLPIN pattern
+                            r'IDENTIFICATION\s+NUMBER[:\s]*([A-Z]{3}-\d{4})',  # Identification Number
+                            r'ID\s+NUMBER[:\s]*([A-Z]{3}-\d{4})'  # ID Number
+                        ]
+                        logger.info(f"   🔎 Searching for LLPIN in excerpt...")
+                        for pattern in llpin_patterns:
+                            llpin_match = re.search(pattern, excerpt_upper)
+                            if llpin_match:
+                                potential_llpin = llpin_match.group(1)
+                                # Validate LLPIN format (3 letters, hyphen, 4 digits)
+                                if re.match(r'^[A-Z]{3}-\d{4}$', potential_llpin):
+                                    extracted["llpin"] = potential_llpin
+                                    logger.info(f"   🎯 LLPIN Found in Excerpt: {extracted['llpin']}")
+                                    break
+                    elif not is_llp and "cin" in extracted and not extracted["cin"]:
                         cin_patterns = [
                             r'CIN[:\s]*([A-Z]\d{5}[A-Z]{2}\d{4}[A-Z]{3}\d{6})',  # CIN: format
                             r'CIN\s+NUMBER[:\s]*([A-Z]\d{5}[A-Z]{2}\d{4}[A-Z]{3}\d{6})',  # CIN Number: format
@@ -1117,16 +1374,25 @@ def extract_company_data_from_parallel_response(response, company_name: str) -> 
                                 logger.info(f"   🎯 Date Found (pattern {k+1}): {extracted['date_of_incorporation']}")
                                 break
                     
-                    # Extract company status - enhanced patterns
+                    # Extract company/LLP status - enhanced patterns
                     if not extracted["company_status"]:
                         # Enhanced status patterns to capture the actual status value
-                        status_patterns = [
-                            r'CURRENT STATUS OF [^-]+ IS - ([A-Z\s]+)\.',  # "Current status of ... is - Active."
-                            r'COMPANY STATUS[:\s-]+([A-Z\s]+)\.',  # "Company Status: Active."
-                            r'STATUS[:\s-]+([A-Z\s]+)\.',  # "Status: Active."
-                            r'CURRENT STATUS[:\s-]+([A-Z\s]+)\.',  # "Current Status: Active."
-                            r'STATUS OF [^-]+ IS - ([A-Z\s]+)\.'  # "Status of ... is - Active."
-                        ]
+                        if is_llp:
+                            status_patterns = [
+                                r'CURRENT STATUS OF [^-]+ IS - ([A-Z\s]+)\.',  # "Current status of ... is - Active."
+                                r'LLP STATUS[:\s-]+([A-Z\s]+)\.',  # "LLP Status: Active."
+                                r'STATUS[:\s-]+([A-Z\s]+)\.',  # "Status: Active."
+                                r'CURRENT STATUS[:\s-]+([A-Z\s]+)\.',  # "Current Status: Active."
+                                r'STATUS OF [^-]+ IS - ([A-Z\s]+)\.'  # "Status of ... is - Active."
+                            ]
+                        else:
+                            status_patterns = [
+                                r'CURRENT STATUS OF [^-]+ IS - ([A-Z\s]+)\.',  # "Current status of ... is - Active."
+                                r'COMPANY STATUS[:\s-]+([A-Z\s]+)\.',  # "Company Status: Active."
+                                r'STATUS[:\s-]+([A-Z\s]+)\.',  # "Status: Active."
+                                r'CURRENT STATUS[:\s-]+([A-Z\s]+)\.',  # "Current Status: Active."
+                                r'STATUS OF [^-]+ IS - ([A-Z\s]+)\.'  # "Status of ... is - Active."
+                            ]
                         
                         status_found = False
                         for i, pattern in enumerate(status_patterns):
@@ -1144,6 +1410,10 @@ def extract_company_data_from_parallel_response(response, company_name: str) -> 
                                     extracted["company_status"] = 'AMALGAMATED'
                                 elif 'CONVERTED' in status_text:
                                     extracted["company_status"] = 'CONVERTED'
+                                elif is_llp and 'DEFUNCT' in status_text:
+                                    extracted["company_status"] = 'DEFUNCT'
+                                elif is_llp and 'DISSOLVED' in status_text:
+                                    extracted["company_status"] = 'DISSOLVED'
                                 else:
                                     extracted["company_status"] = status_text
                                 logger.info(f"   🎯 Status Found (pattern {i+1}): {extracted['company_status']} (from: {status_text})")
@@ -1152,8 +1422,12 @@ def extract_company_data_from_parallel_response(response, company_name: str) -> 
                         
                         # Fallback: look for status keywords in context
                         if not status_found:
-                            status_keywords = ['ACTIVE', 'STRIKE OFF', 'LIQUIDATION', 'AMALGAMATED', 'CONVERTED']
-                            logger.info(f"   🔎 Searching for status keywords...")
+                            if is_llp:
+                                status_keywords = ['ACTIVE', 'STRIKE OFF', 'DEFUNCT', 'DISSOLVED', 'LIQUIDATION']
+                            else:
+                                status_keywords = ['ACTIVE', 'STRIKE OFF', 'LIQUIDATION', 'AMALGAMATED', 'CONVERTED']
+                                
+                            logger.info(f"   🔎 Searching for {'LLP' if is_llp else 'company'} status keywords...")
                             for status in status_keywords:
                                 if status in excerpt_upper:
                                     # Map to standardized status
@@ -1169,7 +1443,11 @@ def extract_company_data_from_parallel_response(response, company_name: str) -> 
                                     break
                     
                     # If we found any data in this excerpt, mark as success
-                    if extracted["cin"] or extracted["date_of_incorporation"] or extracted["company_status"]:
+                    identifier_found = (
+                        (is_llp and extracted.get("llpin")) or 
+                        (not is_llp and extracted.get("cin"))
+                    )
+                    if identifier_found or extracted["date_of_incorporation"] or extracted["company_status"]:
                         extracted["status"] = "success"
                         logger.info(f"   ✅ Found useful data in excerpt {j+1} - marking as success")
                         # Continue processing to potentially find more data
@@ -1179,7 +1457,12 @@ def extract_company_data_from_parallel_response(response, company_name: str) -> 
                     logger.info(f"   ❌ Excerpt is not a string: {type(excerpt)}")
             
             # If we found complete data, we can break out of results loop
-            if extracted["cin"] and extracted["date_of_incorporation"] and extracted["company_status"]:
+            complete_data = (
+                ((is_llp and extracted.get("llpin")) or (not is_llp and extracted.get("cin"))) and
+                extracted["date_of_incorporation"] and 
+                extracted["company_status"]
+            )
+            if complete_data:
                 logger.info(f"   ✅ Complete data found - breaking out of results loop")
                 break
     else:
@@ -1187,134 +1470,17 @@ def extract_company_data_from_parallel_response(response, company_name: str) -> 
     
     logger.info(f"📊 Extraction complete - Final status: {extracted['status']}")
     logger.info(f"📋 Final extracted data:")
-    logger.info(f"   CIN: {'✅' if extracted['cin'] else '❌'} {extracted['cin']}")
+    if is_llp:
+        logger.info(f"   LLPIN: {'✅' if extracted.get('llpin') else '❌'} {extracted.get('llpin', '')}")
+    else:
+        logger.info(f"   CIN: {'✅' if extracted.get('cin') else '❌'} {extracted.get('cin', '')}")
     logger.info(f"   Date: {'✅' if extracted['date_of_incorporation'] else '❌'} {extracted['date_of_incorporation']}")
     logger.info(f"   Status: {'✅' if extracted['company_status'] else '❌'} {extracted['company_status']}")
     
     return extracted
 
-# --- GEMINI FALLBACK FUNCTIONS (LEGACY) ---
-
-def call_gemini_combined_fallback(company_name: str):
-    """Single Gemini fallback for both MCA and EPFO APIs - Uses Portkey Prompt"""
-    logger.info(f"🤖 Calling Gemini combined fallback for: {company_name}")
-    
-    # Use your proven Portkey prompt approach
-    PROMPT_ID = "pp-cin-epfo-3813ba"
-    PORTKEY_URL = f"https://api.portkey.ai/v1/prompts/{PROMPT_ID}/completions"
-    
-    try:
-        payload = {
-            "promptID": PROMPT_ID,
-            "variables": {
-                "company_name": company_name or ""
-            }
-        }
-        
-        headers = {
-            "Content-Type": "application/json",
-            "x-portkey-api-key": CONFIG["PORTKEY_KEY"],
-            "x-portkey-virtual-key": CONFIG["PORTKEY_VIRTUAL"]
-        }
-        
-        logger.info(f"📤 Gemini Combined Portkey Request:")
-        logger.info(f"   URL: {PORTKEY_URL}")
-        logger.info(f"   Payload: {json.dumps(payload, indent=2)}")
-        logger.info(f"   Headers: {json.dumps({k: v if 'key' not in k.lower() else f'{v[:10]}...' for k, v in headers.items()})}")
-        
-        response = requests.post(PORTKEY_URL, headers=headers, json=payload, timeout=60)
-        
-        logger.info(f"📊 Gemini Combined Response Status: {response.status_code}")
-        logger.info(f"📥 Gemini Combined Response Headers: {dict(response.headers)}")
-        
-        # Check for HTTP errors
-        if response.status_code != 200:
-            logger.error(f"❌ Portkey Combined error: Non-200 response ({response.status_code}): {response.text}")
-            return {
-                "cin": "",
-                "establishment_code": "",
-                "date_of_incorporation": "",
-                "company_status": "",
-                "status": "api_error",
-                "source": "gemini_fallback",
-                "error": f"HTTP {response.status_code}: {response.text}"
-            }
-        
-        # Try parsing JSON response
-        try:
-            result = response.json()
-            logger.info(f"📄 Gemini Combined Portkey Response: {json.dumps(result, indent=2)}")
-            
-            # Extract content from Portkey response structure
-            if result and isinstance(result, dict) and result.get('choices'):
-                content = result['choices'][0]['message']['content']
-                logger.info(f"📄 Gemini Content: {content}")
-                
-                # Extract JSON from markdown code blocks
-                json_match = re.search(r'```json\s*\n?(.*?)\n?```', content, re.DOTALL)
-                if not json_match:
-                    # Try without markdown wrapper
-                    json_match = re.search(r'\{.*\}', content, re.DOTALL)
-                
-                if json_match:
-                    try:
-                        gemini_data = json.loads(json_match.group(1) if json_match.groups() else json_match.group())
-                        logger.info(f"📄 Parsed Gemini JSON: {json.dumps(gemini_data, indent=2)}")
-                        
-                        # Add source tracking
-                        gemini_data["source"] = "gemini_fallback"
-                        
-                        # Determine status based on whether we have useful data
-                        has_cin = gemini_data.get('cin', '') and gemini_data.get('cin', '').strip()
-                        has_establishment = gemini_data.get('establishment_code', '') and gemini_data.get('establishment_code', '').upper() != 'N/A'
-                        gemini_data["status"] = "success" if (has_cin or has_establishment) else "not_found"
-                        
-                        logger.info(f"✅ Gemini Combined Final Result: {json.dumps(gemini_data, indent=2)}")
-                        return gemini_data
-                        
-                    except json.JSONDecodeError as je2:
-                        logger.error(f"❌ Failed to parse extracted JSON: {str(je2)}")
-                        return {"cin": "", "establishment_code": "", "date_of_incorporation": "", "company_status": "", "status": "json_parse_error", "source": "gemini_fallback"}
-                else:
-                    logger.error("❌ No JSON found in Gemini content")
-                    return {"cin": "", "establishment_code": "", "date_of_incorporation": "", "company_status": "", "status": "no_json_found", "source": "gemini_fallback"}
-            else:
-                logger.error("❌ Unexpected Portkey Combined response format")
-                return {"cin": "", "establishment_code": "", "date_of_incorporation": "", "company_status": "", "status": "format_error", "source": "gemini_fallback"}
-                
-        except json.JSONDecodeError as je:
-            logger.error(f"❌ Portkey Combined returned non-JSON response: {response.text[:200]}")
-            return {
-                "cin": "",
-                "establishment_code": "",
-                "date_of_incorporation": "",
-                "company_status": "",
-                "status": "parse_error", 
-                "source": "gemini_fallback",
-                "error": f"JSON decode error: {str(je)}"
-            }
-        
-    except Exception as e:
-        logger.error(f"❌ Gemini Combined Fallback Error: {str(e)}")
-        return {
-            "cin": "",
-            "establishment_code": "",
-            "date_of_incorporation": "",
-            "company_status": "",
-            "status": "exception",
-            "source": "gemini_fallback",
-            "error": str(e)
-        }
-
-
-# Legacy functions kept for backward compatibility
-def call_gemini_mca_fallback(company_name: str):
-    """Legacy MCA fallback - now calls combined function"""
-    return call_gemini_combined_fallback(company_name)
-
-def call_gemini_epfo_fallback(company_name: str):
-    """Legacy EPFO fallback - now calls combined function"""
-    return call_gemini_combined_fallback(company_name)
+# --- REMOVED GEMINI FALLBACK ---
+# Gemini fallback functions have been removed. Only Parallel AI fallback is used for MCA data.
 
 
 # --- MAIN LOGIC ORCHESTRATOR ---
@@ -1365,33 +1531,35 @@ def run_full_automation(data: WebhookPayload):
     # If primary MCA failed or has no data, try to use Parallel API data
     elif mca_source == 'parallel_fallback':
         # Parallel API data is directly in the response, not nested under 'result'
-        cin_number = mca.get('cin', '')
-        date_of_incorporation = mca.get('date_of_incorporation', '')
+        # Check if it's LLP data or regular company data
+        is_llp_data = mca.get('is_llp', False)
         
-        # Handle company_status field from Parallel API
-        parallel_status = mca.get('company_status', '')
-        mca_status = parallel_status if parallel_status else ('ACTIVE' if cin_number else 'NOT_FOUND')
-        logger.info(f"📋 Extracted MCA (parallel_fallback) - CIN: {cin_number}, DOI: {date_of_incorporation}, Status: {mca_status}")
-        
-    # Legacy support for Gemini fallback (if still used elsewhere)
-    elif mca_source == 'gemini_fallback':
-        # Gemini data is directly in the response, not nested under 'result'
-        cin_number = mca.get('cin', '')
-        date_of_incorporation = mca.get('date_of_incorporation', '')
-        if not date_of_incorporation:
-            date_of_incorporation = mca.get('dateOfIncorporation', '')
-        
-        # Handle company_status field from Gemini
-        gemini_status = mca.get('company_status', '')
-        mca_status = gemini_status if gemini_status else ('ACTIVE' if cin_number else 'NOT_FOUND')
-        logger.info(f"📋 Extracted MCA (gemini_fallback) - CIN: {cin_number}, DOI: {date_of_incorporation}, Status: {mca_status}")
+        if is_llp_data:
+            # Handle LLP data - use LLPIN instead of CIN
+            llpin_number = mca.get('llpin', '')
+            cin_number = ""  # LLP companies don't have CIN numbers
+            date_of_incorporation = mca.get('date_of_incorporation', '')
+            
+            # Handle company_status field from Parallel API
+            parallel_status = mca.get('company_status', '')
+            mca_status = parallel_status if parallel_status else ('ACTIVE' if llpin_number else 'NOT_FOUND')
+            logger.info(f"📋 Extracted LLP (parallel_fallback) - LLPIN: {llpin_number}, DOI: {date_of_incorporation}, Status: {mca_status}")
+        else:
+            # Handle regular company data
+            cin_number = mca.get('cin', '')
+            date_of_incorporation = mca.get('date_of_incorporation', '')
+            
+            # Handle company_status field from Parallel API
+            parallel_status = mca.get('company_status', '')
+            mca_status = parallel_status if parallel_status else ('ACTIVE' if cin_number else 'NOT_FOUND')
+            logger.info(f"📋 Extracted MCA (parallel_fallback) - CIN: {cin_number}, DOI: {date_of_incorporation}, Status: {mca_status}")
         
     else:
         # No valid MCA data from either source
         mca_status = mca.get('status', '')
         logger.info(f"📋 MCA ({mca_source}) has no result data, status: {mca_status}")
     
-    # Extract EPFO data - prioritize primary API, use Gemini as fallback
+    # Extract EPFO data - only primary API (no fallback)
     epfo_source = epfo.get('source', 'primary_api')
     
     # Try to extract from primary EPFO API first
@@ -1432,20 +1600,31 @@ def run_full_automation(data: WebhookPayload):
         logger.info(f"� EPFO ({epfo_source}) has no result data, status: {epfo.get('status', '')}")
         logger.info("ℹ️ No EPFO fallback - establishment code will be empty")
     
-    # Final status determination - if we have CIN from any source, company is found
+    # Final status determination - if we have CIN or LLPIN from any source, company is found
     final_mca_status = mca_status
-    if cin_number and (mca_status == 'NOT_FOUND' or not mca_status):
-        final_mca_status = 'ACTIVE'  # Default to ACTIVE if we have CIN but no specific status
-        logger.info(f"📊 Updated MCA status to ACTIVE (CIN found from EPFO)")
+    has_identifier = cin_number or ('llpin_number' in locals() and llpin_number)
     
+    if has_identifier and (mca_status == 'NOT_FOUND' or not mca_status):
+        final_mca_status = 'ACTIVE'  # Default to ACTIVE if we have CIN/LLPIN but no specific status
+        identifier_type = "LLPIN" if 'llpin_number' in locals() and llpin_number else "CIN"
+        logger.info(f"📊 Updated MCA status to ACTIVE ({identifier_type} found)")
+    
+    # Prepare final data - use CIN for regular companies, LLPIN for LLP companies
     final_data = {
         "legalName": cleaned_name,
-        "cin": cin_number,
         "dateOfIncorporation": date_of_incorporation,
         "status": final_mca_status,
         "establishmentId": establishment_code,
         "paymentDetails": payment_details_data
     }
+    
+    # Add appropriate identifier - CIN for regular companies, LLPIN for LLP companies
+    if 'llpin_number' in locals() and llpin_number:
+        final_data["llpin"] = llpin_number
+        logger.info(f"📋 Added LLPIN to final data (LLP company): {llpin_number}")
+    else:
+        final_data["cin"] = cin_number
+        logger.info(f"📋 Added CIN to final data (regular company): {cin_number}")
     
     logger.info(f"📋 Prepared ERDB Data: {json.dumps(final_data, indent=2)}")
     
